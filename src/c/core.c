@@ -1,4 +1,6 @@
 #include "logicforth.h"
+#include <unistd.h>
+#include <isocline.h>
 
 void gc_root_push(Interpreter *interp, Val value) {
 	if (interp->n_gc_roots < MAX_GC_ROOTS) {
@@ -1493,6 +1495,82 @@ Interpreter *interp_new(void) {
 	return interp;
 }
 
+static const char *structure_depth_style(int depth) {
+	switch (depth) {
+		case 0:  return NULL;
+		case 1:  return "lf-depth1";
+		case 2:  return "lf-depth2";
+		case 3:  return "lf-depth3";
+		default: return "lf-depth4";
+	}
+}
+
+static void define_structure_styles(void) {
+	ic_style_def("lf-depth1", "on #3a3a3a");
+	ic_style_def("lf-depth2", "on #484848");
+	ic_style_def("lf-depth3", "on #565656");
+	ic_style_def("lf-depth4", "on #646464");
+}
+
+static int structure_token_delta(const char *token, int token_len) {
+	if (token_len == 1) {
+		if (token[0] == ':' || token[0] == '[' || token[0] == '{') return 1;
+		if (token[0] == ';' || token[0] == ']' || token[0] == '}') return -1;
+	}
+	if (token_len == 2 && token[0] == '[' && token[1] == ':') return 1;
+	if (token_len == 2 && token[0] == ':' && token[1] == ']') return -1;
+	return 0;
+}
+
+static int scan_structure_depth(const char *s, int len, int start_depth, ic_highlight_env_t *env) {
+	int depth = start_depth;
+	int i = 0;
+
+	while (i < len) {
+		char c = s[i];
+
+		if (isspace((unsigned char)c)) {
+			if (env && depth > 0) ic_highlight(env, i, 1, structure_depth_style(depth));
+			i++;
+			continue;
+		}
+
+		int span_start = i;
+		int span_depth = depth;
+
+		if (c == '"') {
+			i++;
+			while (i < len && s[i] != '"') i++;
+			if (i < len) i++;
+		} else if (c == '(' && (i + 1 >= len || isspace((unsigned char)s[i + 1]))) {
+			while (i < len && s[i] != ')') i++;
+			if (i < len) i++;
+		} else if (c == '\\' && (i + 1 >= len || isspace((unsigned char)s[i + 1]))) {
+			while (i < len) i++;
+		} else {
+			while (i < len && !isspace((unsigned char)s[i])) i++;
+			int delta = structure_token_delta(&s[span_start], i - span_start);
+			if (delta > 0) {
+				depth++;
+				span_depth = depth;
+			} else if (delta < 0) {
+				depth--;
+				if (depth < 0) depth = 0;
+			}
+		}
+
+		if (env && span_depth > 0) ic_highlight(env, span_start, i - span_start, structure_depth_style(span_depth));
+	}
+
+	return depth;
+}
+
+static void repl_highlighter(ic_highlight_env_t *env, const char *input, void *arg) {
+	Interpreter *interp = (Interpreter *)arg;
+	int base_depth = scan_structure_depth(interp->input_buffer, interp->input_buffer_len, 0, NULL);
+	scan_structure_depth(input, (int)strlen(input), base_depth, env);
+}
+
 int main(void) {
 	Interpreter *interp = interp_new();
 
@@ -1645,14 +1723,43 @@ int main(void) {
 	interp->vocab->lib_end_latest_cfa = interp->vocab->latest_cfa;
 
 	printf("logicforth %s\n", VERSION);
-	char line[1024];
+	char fgets_buf[1024];
+	int interactive = isatty(fileno(stdin));
 
-	while (fgets(line, sizeof(line), stdin)) {
-		int line_len = (int)strlen(line);
-		if (interp->input_buffer_len + line_len < INPUT_BUFFER_SIZE - 1) {
-			memcpy(interp->input_buffer + interp->input_buffer_len, line, (size_t)line_len + 1);
-			interp->input_buffer_len += line_len;
+	static char history_path[512];
+	if (interactive) {
+		ic_enable_multiline(false);
+		ic_set_prompt_marker("", "");
+		define_structure_styles();
+		ic_set_default_highlighter(repl_highlighter, interp);
+
+		const char *home = getenv("HOME");
+		if (home) {
+			snprintf(history_path, sizeof(history_path), "%s/.logicforth_history", home);
+			ic_set_history(history_path, -1);
+		} else {
+			ic_set_history(NULL, -1);
 		}
+	}
+
+	while (1) {
+		char *line;
+		if (interactive) {
+			line = ic_readline("");
+			if (line == NULL) break;
+		} else {
+			if (fgets(fgets_buf, sizeof(fgets_buf), stdin) == NULL) break;
+			line = fgets_buf;
+		}
+
+		int line_len = (int)strlen(line);
+		if (interp->input_buffer_len + line_len + 1 < INPUT_BUFFER_SIZE - 1) {
+			memcpy(interp->input_buffer + interp->input_buffer_len, line, (size_t)line_len);
+			interp->input_buffer_len += line_len;
+			if (interactive) interp->input_buffer[interp->input_buffer_len++] = '\n';
+			interp->input_buffer[interp->input_buffer_len] = 0;
+		}
+		if (interactive) ic_free(line);
 
 		interp->error_flag = 0;
 		interp->need_more = 0;
